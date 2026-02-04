@@ -1,6 +1,6 @@
 {
   "name": "ebounce-checker",
-  "version": "1.0.0",
+  "version": "1.0.4",
   "description": "Local email bounce checker",
   "main": "main.js",
   "author": "",
