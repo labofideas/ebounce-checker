@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+backend/.venv/
+backend/__pycache__/
+backend/.python-version
+backend/*.pyc

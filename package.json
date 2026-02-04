@@ -1,0 +1,43 @@
+{
+  "name": "ebounce-checker",
+  "version": "1.0.0",
+  "description": "Local email bounce checker",
+  "main": "main.js",
+  "author": "",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "build:mac": "electron-builder --mac"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.0"
+  },
+  "devDependencies": {
+    "electron": "^31.3.1",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.ebounce.checker",
+    "productName": "Ebounce Checker",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "labofideas",
+        "repo": "ebounce-checker"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns"
+    },
+    "files": [
+      "**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "backend",
+        "to": "backend"
+      }
+    ]
+  }
+}
