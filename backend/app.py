@@ -211,6 +211,53 @@ def resolve_domain(domain: str, resolver: dns.resolver.Resolver, cache: Dict[str
     return info
 
 
+def resolve_spf(domain: str, resolver: dns.resolver.Resolver, cache: Dict[str, str]) -> str:
+    if domain in cache:
+        return cache[domain]
+    try:
+        answers = resolver.resolve(domain, "TXT")
+        for r in answers:
+            txt = "".join([t.decode() if isinstance(t, bytes) else t for t in r.strings])
+            if txt.lower().startswith("v=spf1"):
+                cache[domain] = "spf_present"
+                return cache[domain]
+        cache[domain] = "spf_missing"
+        return cache[domain]
+    except Exception:
+        cache[domain] = "spf_unknown"
+        return cache[domain]
+
+
+def resolve_dmarc(domain: str, resolver: dns.resolver.Resolver, cache: Dict[str, str]) -> str:
+    if domain in cache:
+        return cache[domain]
+    try:
+        dmarc_domain = f"_dmarc.{domain}"
+        answers = resolver.resolve(dmarc_domain, "TXT")
+        for r in answers:
+            txt = "".join([t.decode() if isinstance(t, bytes) else t for t in r.strings])
+            if txt.lower().startswith("v=dmarc1"):
+                cache[domain] = "dmarc_present"
+                return cache[domain]
+        cache[domain] = "dmarc_missing"
+        return cache[domain]
+    except Exception:
+        cache[domain] = "dmarc_unknown"
+        return cache[domain]
+
+
+def classify_label(status: str) -> str:
+    if status in {"invalid_syntax", "smtp_undeliverable"}:
+        return "Invalid"
+    if status in {"domain_no_mx", "smtp_unknown"}:
+        return "Risky"
+    if status in {"domain_mx", "smtp_deliverable"}:
+        return "Safe"
+    if status == "duplicate":
+        return "Duplicate"
+    return "Unknown"
+
+
 def smtp_probe(email: str, mx_hosts: List[str]) -> Tuple[str, str]:
     import smtplib
 
@@ -328,6 +375,9 @@ def process_job(job_id: str, input_path: str, options: Dict):
                     "reason": "",
                     "domain": "",
                     "mx_hosts": "",
+                    "spf_status": "",
+                    "dmarc_status": "",
+                    "label": "",
                     "smtp_response": "",
                 }
                 if normalized is None:
@@ -349,21 +399,29 @@ def process_job(job_id: str, input_path: str, options: Dict):
         resolver.lifetime = 3
         resolver.timeout = 2
         domain_cache: Dict[str, DomainInfo] = {}
+        spf_cache: Dict[str, str] = {}
+        dmarc_cache: Dict[str, str] = {}
 
-        update_job(job_id, phase="dns", processed=0)
+        update_job(job_id, phase="dns", processed=0, phase_total=0)
         processed_dns = 0
-        for entry in entries:
+        dns_targets = [e for e in entries if not e["status"] and e["normalized_email"]]
+        update_job(job_id, phase="dns", processed=0, phase_total=len(dns_targets))
+        for entry in dns_targets:
             if entry["status"] or not entry["normalized_email"]:
                 continue
             if not use_mx:
                 entry["status"] = "syntax_valid"
                 entry["reason"] = "Syntax OK"
+                entry["label"] = classify_label(entry["status"])
                 continue
 
             info = resolve_domain(entry["domain"], resolver, domain_cache)
             entry["status"] = info.status
             entry["reason"] = info.reason
             entry["mx_hosts"] = ";".join(info.mx_hosts)
+            entry["spf_status"] = resolve_spf(entry["domain"], resolver, spf_cache)
+            entry["dmarc_status"] = resolve_dmarc(entry["domain"], resolver, dmarc_cache)
+            entry["label"] = classify_label(entry["status"])
             processed_dns += 1
             if processed_dns % 200 == 0:
                 update_job(job_id, processed=processed_dns, phase="dns")
@@ -372,6 +430,7 @@ def process_job(job_id: str, input_path: str, options: Dict):
         if use_smtp:
             update_job(job_id, phase="smtp", processed=0)
             smtp_targets = [e for e in entries if e["status"] == "domain_mx"]
+            update_job(job_id, phase="smtp", processed=0, phase_total=len(smtp_targets))
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
             def do_check(entry):
@@ -387,12 +446,13 @@ def process_job(job_id: str, input_path: str, options: Dict):
                 futures = [pool.submit(do_check, e) for e in smtp_targets]
                 for f in as_completed(futures):
                     entry, status, reason = f.result()
-                    entry["status"] = status
-                    entry["reason"] = reason
-                    entry["smtp_response"] = reason
-                    processed_smtp += 1
-                    if processed_smtp % 50 == 0:
-                        update_job(job_id, processed=processed_smtp, phase="smtp")
+                entry["status"] = status
+                entry["reason"] = reason
+                entry["label"] = classify_label(entry["status"])
+                entry["smtp_response"] = reason
+                processed_smtp += 1
+                if processed_smtp % 50 == 0:
+                    update_job(job_id, processed=processed_smtp, phase="smtp")
 
         # Write output files
         update_job(job_id, phase="write", processed=0)
@@ -411,6 +471,9 @@ def process_job(job_id: str, input_path: str, options: Dict):
             "reason",
             "domain",
             "mx_hosts",
+            "spf_status",
+            "dmarc_status",
+            "label",
             "smtp_response",
         ]
 
@@ -459,6 +522,9 @@ def smtp_batch_job(job_id: str, batch_size: int):
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             fieldnames = reader.fieldnames or []
+            for extra in ["spf_status", "dmarc_status", "label", "smtp_response"]:
+                if extra not in fieldnames:
+                    fieldnames.append(extra)
             for row in reader:
                 rows.append(row)
                 if len(targets) < batch_size and row.get("status") == "domain_mx":
@@ -489,6 +555,7 @@ def smtp_batch_job(job_id: str, batch_size: int):
                 entry["status"] = status
                 entry["reason"] = reason
                 entry["smtp_response"] = reason
+                entry["label"] = classify_label(entry["status"])
                 processed += 1
                 if processed % 50 == 0:
                     update_job(job_id, processed=processed)
@@ -496,7 +563,7 @@ def smtp_batch_job(job_id: str, batch_size: int):
         # write back updated results
         tmp_path = path + ".tmp"
         with open(tmp_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         os.replace(tmp_path, path)
@@ -535,6 +602,9 @@ def smtp_selected_job(job_id: str, emails: List[str]):
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             fieldnames = reader.fieldnames or []
+            for extra in ["spf_status", "dmarc_status", "label", "smtp_response"]:
+                if extra not in fieldnames:
+                    fieldnames.append(extra)
             for row in reader:
                 rows.append(row)
                 normalized = (row.get("normalized_email") or "").lower()
@@ -562,13 +632,14 @@ def smtp_selected_job(job_id: str, emails: List[str]):
                 entry["status"] = status
                 entry["reason"] = reason
                 entry["smtp_response"] = reason
+                entry["label"] = classify_label(entry["status"])
                 processed += 1
                 if processed % 50 == 0:
                     update_job(job_id, processed=processed)
 
         tmp_path = path + ".tmp"
         with open(tmp_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         os.replace(tmp_path, path)
@@ -764,6 +835,7 @@ def index() -> str:
       <div class="actions">
         <button type="submit" id="startMxBig">Start MX Scan</button>
         <button type="button" id="presetMx">MX Only (Recommended)</button>
+        <button type="button" id="inspectCsv">Detect Email Column</button>
         <span class="note" id="statusLine"></span>
       </div>
     </form>
@@ -782,6 +854,7 @@ def index() -> str:
     const jobsList = document.getElementById('jobsList');
     const presetMx = document.getElementById('presetMx');
     const startMxBig = document.getElementById('startMxBig');
+    const inspectCsv = document.getElementById('inspectCsv');
     let pollTimer = null;
     let activeJobId = null;
     const selectedEmails = new Set();
@@ -815,6 +888,25 @@ def index() -> str:
       form.querySelector('input[name="check_mx"]').checked = true;
       form.querySelector('input[name="check_smtp"]').checked = false;
     });
+    inspectCsv.addEventListener('click', async () => {
+      statusLine.textContent = 'Inspecting...';
+      const data = new FormData(form);
+      const res = await fetch('/inspect', { method: 'POST', body: data });
+      const json = await res.json();
+      if (json.error) {
+        statusLine.textContent = json.error;
+        return;
+      }
+      if (json.headers && json.headers.length) {
+        const list = json.headers.map((h) => `"${h}"`).join(', ');
+        statusLine.textContent = `Detected columns: ${list}`;
+      } else {
+        statusLine.textContent = 'No headers detected. Try using column number (1,2,3).';
+      }
+      if (json.guess) {
+        form.querySelector('input[name="email_column"]').value = json.guess;
+      }
+    });
 
     function startPolling(jobId) {
       if (pollTimer) clearInterval(pollTimer);
@@ -841,6 +933,9 @@ def index() -> str:
           <button id="filterMxValid" type="button">Only MX‑valid</button>
           <button id="downloadSummary" type="button">Download Summary CSV</button>
           <button id="downloadMxValid" type="button">Download MX‑valid CSV</button>
+          <button id="downloadSafe" type="button">Download Safe CSV</button>
+          <button id="downloadRiskyLabel" type="button">Download Risky CSV</button>
+          <button id="downloadInvalid" type="button">Download Invalid CSV</button>
         </div>
         <div class="filters" id="smtpControls" style="display:none;">
           <input type="number" id="smtpBatchSize" value="500" min="50" max="2000" />
@@ -869,6 +964,7 @@ def index() -> str:
                 <th>Email</th>
                 <th>Normalized</th>
                 <th>Status</th>
+                <th>Label</th>
                 <th>Reason</th>
                 <th>Domain</th>
               </tr>
@@ -890,6 +986,9 @@ def index() -> str:
       const filterMxValid = document.getElementById('filterMxValid');
       const downloadSummary = document.getElementById('downloadSummary');
       const downloadMxValid = document.getElementById('downloadMxValid');
+      const downloadSafe = document.getElementById('downloadSafe');
+      const downloadRiskyLabel = document.getElementById('downloadRiskyLabel');
+      const downloadInvalid = document.getElementById('downloadInvalid');
       const smtpControls = document.getElementById('smtpControls');
       const smtpBatchSize = document.getElementById('smtpBatchSize');
       const runSmtpBatch = document.getElementById('runSmtpBatch');
@@ -927,6 +1026,7 @@ def index() -> str:
             <td>${row.email}</td>
             <td>${row.normalized_email}</td>
             <td>${row.status}</td>
+            <td>${row.label || ''}</td>
             <td>${row.reason}</td>
             <td>${row.domain}</td>
           `;
@@ -987,6 +1087,15 @@ def index() -> str:
       });
       downloadMxValid.addEventListener('click', () => {
         window.location = `/download_mx_valid/${jobId}`;
+      });
+      downloadSafe.addEventListener('click', () => {
+        window.location = `/download_label/${jobId}?label=Safe`;
+      });
+      downloadRiskyLabel.addEventListener('click', () => {
+        window.location = `/download_label/${jobId}?label=Risky`;
+      });
+      downloadInvalid.addEventListener('click', () => {
+        window.location = `/download_label/${jobId}?label=Invalid`;
       });
 
       runSmtpBatch.addEventListener('click', async () => {
@@ -1054,9 +1163,33 @@ def index() -> str:
           clearInterval(pollTimer);
           return;
         }
-        const progress = json.total_rows ? Math.min(100, Math.round((json.processed / json.total_rows) * 100)) : 0;
+        const phaseTotal = json.phase_total || json.total_rows || 0;
+        const progress = phaseTotal ? Math.min(100, Math.round((json.processed / phaseTotal) * 100)) : 0;
         bar.style.width = `${progress}%`;
-        meta.textContent = `Phase: ${json.phase || 'queued'} | ${json.processed || 0}/${json.total_rows || 0} rows`;
+        // Estimate ETA
+        if (!window.__ebounceRate) {
+          window.__ebounceRate = { lastTime: Date.now(), lastProcessed: 0, rate: 0 };
+        }
+        const rateState = window.__ebounceRate;
+        const now = Date.now();
+        const processed = json.processed || 0;
+        const total = phaseTotal || 0;
+        const deltaT = (now - rateState.lastTime) / 1000;
+        const deltaP = processed - rateState.lastProcessed;
+        if (deltaT > 0.5 && deltaP >= 0) {
+          rateState.rate = deltaP / deltaT;
+          rateState.lastTime = now;
+          rateState.lastProcessed = processed;
+        }
+        let etaText = '';
+        if (rateState.rate > 0 && total > 0) {
+          const remaining = Math.max(0, total - processed);
+          const seconds = Math.round(remaining / rateState.rate);
+          const mins = Math.floor(seconds / 60);
+          const secs = seconds % 60;
+          etaText = ` | ETA: ${mins}m ${secs}s`;
+        }
+        meta.textContent = `Phase: ${json.phase || 'queued'} | ${processed}/${total} rows | ${progress}%${etaText}`;
         statusLine.textContent = json.status || '';
         if (json.last_smtp_batch_at) {
           const dt = new Date(json.last_smtp_batch_at * 1000);
@@ -1162,6 +1295,7 @@ async def process(
         "phase": "queued",
         "processed": 0,
         "total_rows": 0,
+        "phase_total": 0,
         "last_smtp_batch_at": None,
         "smtp_paused": False,
     }
@@ -1201,6 +1335,7 @@ def status(job_id: str):
             "phase": job.get("phase"),
             "processed": job.get("processed", 0),
             "total_rows": job.get("total_rows", 0),
+            "phase_total": job.get("phase_total", 0),
             "summary": job.get("summary", {}),
             "downloads": job.get("downloads", {}),
             "error": job.get("error"),
@@ -1410,6 +1545,73 @@ def download_mx_valid(job_id: str):
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/download_label/{job_id}")
+def download_label(job_id: str, label: str = ""):
+    job = JOBS.get(job_id)
+    if not job:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    path = os.path.join(job["dir"], "all_results.csv")
+    if not os.path.exists(path):
+        return JSONResponse({"error": "File not found"}, status_code=404)
+
+    label = label.strip().capitalize()
+    if label not in {"Safe", "Risky", "Invalid"}:
+        return JSONResponse({"error": "Invalid label"}, status_code=400)
+
+    filename = f"{label.lower()}_results.csv"
+
+    def row_iter():
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=reader.fieldnames)
+            writer.writeheader()
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+            for row in reader:
+                if (row.get("label") or "").capitalize() != label:
+                    continue
+                writer.writerow(row)
+                yield output.getvalue()
+                output.seek(0)
+                output.truncate(0)
+
+    return StreamingResponse(
+        row_iter(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/inspect")
+async def inspect(file: UploadFile = File(...)):
+    raw = await file.read()
+    text = None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            break
+        except Exception:
+            continue
+    if text is None:
+        return JSONResponse({"error": "Unable to decode file"}, status_code=400)
+
+    reader = csv.reader(io.StringIO(text))
+    try:
+        headers = next(reader)
+    except StopIteration:
+        return JSONResponse({"error": "Empty CSV"}, status_code=400)
+
+    guess = None
+    for h in headers:
+        if h.strip().lower() in COMMON_EMAIL_HEADERS:
+            guess = h
+            break
+
+    return JSONResponse({"headers": headers, "guess": guess})
 
 
 @app.get("/emails_filtered/{job_id}")
