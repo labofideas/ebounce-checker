@@ -1,5 +1,6 @@
 const { app, BrowserWindow, dialog } = require('electron');
 const { autoUpdater } = require('electron-updater');
+const { ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
@@ -129,13 +130,23 @@ app.whenReady().then(async () => {
       title: 'Ebounce Checker',
       backgroundColor: '#0f1115',
       webPreferences: {
-        contextIsolation: true
+        contextIsolation: true,
+        preload: path.join(__dirname, 'preload.js')
       }
     });
     win.loadURL(`http://127.0.0.1:${port}`);
     loading.close();
     autoUpdater.checkForUpdatesAndNotify().catch((err) => {
       logLine(`Auto-update error: ${err.message}`);
+    });
+    ipcMain.handle('check-for-updates', async () => {
+      try {
+        await autoUpdater.checkForUpdatesAndNotify();
+        return { ok: true };
+      } catch (err) {
+        logLine(`Manual update check error: ${err.message}`);
+        return { ok: false, error: err.message };
+      }
     });
   } catch (err) {
     loading.close();

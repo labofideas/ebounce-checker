@@ -812,6 +812,10 @@ def index() -> str:
       2) Use <strong>Only MX‑valid</strong> to filter.
       3) Select emails and run SMTP in small batches.
     </div>
+    <div style="margin-bottom:14px;">
+      <button type="button" id="checkUpdates">Check for Updates</button>
+      <span class="note" id="updateStatus"></span>
+    </div>
 
     <form id="uploadForm">
       <label>CSV File</label>
@@ -855,6 +859,8 @@ def index() -> str:
     const presetMx = document.getElementById('presetMx');
     const startMxBig = document.getElementById('startMxBig');
     const inspectCsv = document.getElementById('inspectCsv');
+    const checkUpdates = document.getElementById('checkUpdates');
+    const updateStatus = document.getElementById('updateStatus');
     let pollTimer = null;
     let activeJobId = null;
     const selectedEmails = new Set();
@@ -907,6 +913,16 @@ def index() -> str:
         form.querySelector('input[name="email_column"]').value = json.guess;
       }
     });
+
+    if (window?.ebounce?.checkUpdates) {
+      checkUpdates.addEventListener('click', async () => {
+        updateStatus.textContent = 'Checking...';
+        const res = await window.ebounce.checkUpdates();
+        updateStatus.textContent = res.ok ? 'Update check started.' : `Update check failed: ${res.error}`;
+      });
+    } else {
+      checkUpdates.style.display = 'none';
+    }
 
     function startPolling(jobId) {
       if (pollTimer) clearInterval(pollTimer);
